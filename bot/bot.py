@@ -202,7 +202,7 @@ class GLPIClient:
         http = await self._get_http()
         async with http.get(
             f"{GLPI_URL}/apirest.php/ITILCategory",
-            params={"range": "0-200", "is_helpdeskvisible": 1},
+            params={"range": "0-200", "is_helpdeskvisible": 1, "is_active": 1},
             headers=self._auth_headers,
         ) as resp:
             if resp.status == 401:
