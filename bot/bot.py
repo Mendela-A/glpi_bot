@@ -336,6 +336,21 @@ glpi = GLPIClient()
 # ---------------------------------------------------------------------------
 
 
+@dp.message.middleware()
+async def private_only_middleware(handler, event: Message, data: dict):
+    if event.chat.type != "private":
+        me = await bot.get_me()
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✉️ Написати боту", url=f"https://t.me/{me.username}?start=1")
+        ]])
+        await event.answer(
+            "⚠️ Заявки приймаються тільки в особистих повідомленнях.",
+            reply_markup=kb,
+        )
+        return
+    return await handler(event, data)
+
+
 # @dp.message.middleware()
 # async def auth_middleware(handler, event: Message, data: dict):
 #     if ALLOWED_USER_IDS and event.from_user.id not in ALLOWED_USER_IDS:
