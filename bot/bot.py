@@ -539,6 +539,7 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.edit_text(
             "❌ Не вдалося створити заявку. Спробуйте пізніше або зверніться до адміністратора."
         )
+        await bot.send_message(callback.from_user.id, "Головне меню:", reply_markup=MAIN_MENU)
         return
 
     if data.get("photo_bytes"):
@@ -555,6 +556,7 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         f"✅ Заявку {hbold(f'#{ticket_id}')} створено!\n"
         f"Ми зв'яжемося з вами найближчим часом."
     )
+    await bot.send_message(callback.from_user.id, "Головне меню:", reply_markup=MAIN_MENU)
 
     username_part = f"@{user.username}" if user.username else user.full_name
     phone_part = f"\n📱 Тел: {data['phone']}" if data.get("phone") else ""
