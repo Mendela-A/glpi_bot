@@ -22,11 +22,11 @@ services:
     ports:
       - "8080:80"
     environment:
-      MARIADB_HOST: mariadb
-      MARIADB_PORT: 3306
-      MARIADB_DATABASE: ${MARIADB_DATABASE}
-      MARIADB_USER: ${MARIADB_USER}
-      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+      GLPI_DB_HOST: mariadb
+      GLPI_DB_PORT: 3306
+      GLPI_DB_NAME: ${MARIADB_DATABASE}
+      GLPI_DB_USER: ${MARIADB_USER}
+      GLPI_DB_PASSWORD: ${MARIADB_PASSWORD}
     volumes:
       - ./glpi/config:/var/www/html/config
       - ./glpi/files:/var/www/html/files
