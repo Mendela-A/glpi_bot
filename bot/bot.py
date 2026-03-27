@@ -621,6 +621,20 @@ async def my_tickets(message: Message) -> None:
 @dp.callback_query(F.data.startswith("cancel:"))
 async def cancel_ticket_callback(callback: CallbackQuery) -> None:
     ticket_id = int(callback.data.removeprefix("cancel:"))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Так, скасувати", callback_data=f"cancel_yes:{ticket_id}"),
+        InlineKeyboardButton(text="↩ Назад", callback_data="cancel_back"),
+    ]])
+    await callback.message.edit_text(
+        f"Скасувати заявку <b>#{ticket_id}</b>? Цю дію не можна відмінити.",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("cancel_yes:"))
+async def cancel_ticket_confirm(callback: CallbackQuery) -> None:
+    ticket_id = int(callback.data.removeprefix("cancel_yes:"))
     try:
         await glpi.cancel_ticket(ticket_id)
         await callback.answer(f"Заявку #{ticket_id} скасовано.", show_alert=True)
@@ -635,6 +649,21 @@ async def cancel_ticket_callback(callback: CallbackQuery) -> None:
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception:
         pass
+
+
+@dp.callback_query(F.data == "cancel_back")
+async def cancel_ticket_back(callback: CallbackQuery) -> None:
+    try:
+        tickets = await glpi.get_user_tickets(callback.from_user.id)
+        if tickets:
+            text, kb = _build_tickets_message(tickets)
+        else:
+            text, kb = "У вас ще немає заявок.", None
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception as e:
+        log.error("Помилка повернення до списку заявок: %s", e)
+        await callback.answer("❌ Не вдалося оновити список.", show_alert=True)
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
