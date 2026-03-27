@@ -686,15 +686,12 @@ async def check_closed_tickets() -> None:
         now = datetime.now(timezone.utc)
         try:
             tickets = await glpi.get_recently_closed_tickets(since=last_check)
-            log.info("Polling: знайдено %d закритих заявок (since=%s)", len(tickets), last_check)
             for ticket in tickets:
-                log.info("Ticket raw: %s", ticket)
                 ticket_id   = ticket.get("2") or ticket.get("id", "?")
                 ticket_name = ticket.get("1") or ticket.get("name", "—")
                 content     = ticket.get("21", "")
                 match = re.search(r'\[tg:(\d+)\]', content)
                 if not match:
-                    log.info("Ticket #%s: [tg:ID] не знайдено в content: %r", ticket_id, content)
                     continue  # заявка не з бота — пропускаємо
                 telegram_user_id = int(match.group(1))
                 try:
