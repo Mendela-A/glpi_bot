@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timezone
 
 import json
+import re
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -225,6 +226,7 @@ class GLPIClient:
             "forcedisplay[0]": "2",              # name
             "forcedisplay[1]": "12",             # status
             "forcedisplay[2]": "17",             # closedate
+            "forcedisplay[3]": "21",             # content (містить [tg:USER_ID])
             "range": "0-50",
         }
         async with http.get(
@@ -679,13 +681,21 @@ async def check_closed_tickets() -> None:
         try:
             tickets = await glpi.get_recently_closed_tickets(since=last_check)
             for ticket in tickets:
-                ticket_id = ticket.get("2") or ticket.get("id", "?")
+                ticket_id   = ticket.get("2") or ticket.get("id", "?")
                 ticket_name = ticket.get("1") or ticket.get("name", "—")
-                await bot.send_message(
-                    TECHNICIANS_CHAT_ID,
-                    f"✅ Заявку {hbold(f'#{ticket_id}')} закрито\n"
-                    f"📂 {ticket_name}",
-                )
+                content     = ticket.get("21", "")
+                match = re.search(r'\[tg:(\d+)\]', content)
+                if not match:
+                    continue  # заявка не з бота — пропускаємо
+                telegram_user_id = int(match.group(1))
+                try:
+                    await bot.send_message(
+                        telegram_user_id,
+                        f"✅ Вашу заявку {hbold(f'#{ticket_id}')} закрито.\n"
+                        f"📂 {ticket_name}",
+                    )
+                except Exception as e:
+                    log.warning("Не вдалося сповістити користувача %s: %s", telegram_user_id, e)
         except Exception as e:
             log.error("Помилка перевірки закритих заявок: %s", e)
         last_check = now
