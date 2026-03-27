@@ -202,7 +202,7 @@ class GLPIClient:
         http = await self._get_http()
         async with http.get(
             f"{GLPI_URL}/apirest.php/ITILCategory",
-            params={"range": "0-200", "is_helpdeskvisible": 1, "is_active": 1},
+            params={"range": "0-200"},
             headers=self._auth_headers,
         ) as resp:
             if resp.status == 401:
@@ -210,7 +210,13 @@ class GLPIClient:
                 return await self.get_categories()
             resp.raise_for_status()
             data = await resp.json()
-            return {item["completename"]: item["id"] for item in data if isinstance(item, dict)}
+            return {
+                item["completename"]: item["id"]
+                for item in data
+                if isinstance(item, dict)
+                and item.get("is_active") != 0
+                and item.get("is_helpdeskvisible") == 1
+            }
 
     async def get_recently_closed_tickets(self, since: datetime) -> list[dict]:
         """Повертає заявки зі статусом Closed, закриті після `since`."""
@@ -680,12 +686,15 @@ async def check_closed_tickets() -> None:
         now = datetime.now(timezone.utc)
         try:
             tickets = await glpi.get_recently_closed_tickets(since=last_check)
+            log.info("Polling: знайдено %d закритих заявок (since=%s)", len(tickets), last_check)
             for ticket in tickets:
+                log.info("Ticket raw: %s", ticket)
                 ticket_id   = ticket.get("2") or ticket.get("id", "?")
                 ticket_name = ticket.get("1") or ticket.get("name", "—")
                 content     = ticket.get("21", "")
                 match = re.search(r'\[tg:(\d+)\]', content)
                 if not match:
+                    log.info("Ticket #%s: [tg:ID] не знайдено в content: %r", ticket_id, content)
                     continue  # заявка не з бота — пропускаємо
                 telegram_user_id = int(match.group(1))
                 try:
@@ -694,6 +703,7 @@ async def check_closed_tickets() -> None:
                         f"✅ Вашу заявку {hbold(f'#{ticket_id}')} закрито.\n"
                         f"📂 {ticket_name}",
                     )
+                    log.info("Сповіщено користувача %s про закриття заявки #%s", telegram_user_id, ticket_id)
                 except Exception as e:
                     log.warning("Не вдалося сповістити користувача %s: %s", telegram_user_id, e)
         except Exception as e:
