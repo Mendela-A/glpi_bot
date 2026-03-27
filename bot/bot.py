@@ -65,12 +65,20 @@ TICKET_STATUSES: dict[int, str] = {
 # ---------------------------------------------------------------------------
 
 
+PRIORITIES: dict[str, int] = {
+    "🟢 Низький":  2,
+    "🟡 Середній": 3,
+    "🔴 Високий":  4,
+}
+
+
 class TicketForm(StatesGroup):
-    category = State()
+    category    = State()
     description = State()
-    photo = State()
-    phone = State()
-    confirm = State()
+    priority    = State()
+    photo       = State()
+    phone       = State()
+    confirm     = State()
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +133,7 @@ class GLPIClient:
         if not self._session_token:
             await self.init_session()
 
-    async def create_ticket(self, name: str, content: str, category_id: int, telegram_user_id: int, phone: str | None = None) -> dict:
+    async def create_ticket(self, name: str, content: str, category_id: int, telegram_user_id: int, phone: str | None = None, priority: int = 3) -> dict:
         await self._ensure_session()
         http = await self._get_http()
         extra = f"\nТелефон: {phone}" if phone else ""
@@ -136,8 +144,9 @@ class GLPIClient:
                 "content": tagged_content,
                 "itilcategories_id": category_id,
                 "type": 1,           # 1 = Incident
-                "urgency": 3,        # Medium
-                "impact": 3,
+                "urgency": priority,
+                "impact": priority,
+                "priority": priority,
                 "requesttypes_id": 7,  # Telegram Bot
             }
         }
@@ -268,6 +277,21 @@ class GLPIClient:
                 return
             resp.raise_for_status()
 
+    async def cancel_ticket(self, ticket_id: int) -> None:
+        """Закриває заявку (status=6)."""
+        await self._ensure_session()
+        http = await self._get_http()
+        async with http.put(
+            f"{GLPI_URL}/apirest.php/Ticket/{ticket_id}",
+            json={"input": {"status": 6}},
+            headers=self._auth_headers,
+        ) as resp:
+            if resp.status == 401:
+                await self.init_session()
+                await self.cancel_ticket(ticket_id)
+                return
+            resp.raise_for_status()
+
     async def close(self) -> None:
         await self.kill_session()
         if self._http and not self._http.closed:
@@ -309,6 +333,13 @@ SKIP_PHOTO_MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="⏭ Пропустити фото")]],
     resize_keyboard=True,
 )
+
+
+def priority_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=label, callback_data=f"pri:{val}")
+        for label, val in PRIORITIES.items()
+    ]])
 
 
 def confirm_keyboard() -> InlineKeyboardMarkup:
@@ -413,20 +444,30 @@ async def process_description(message: Message, state: FSMContext) -> None:
         await message.answer("Будь ласка, опишіть проблему детальніше (мінімум 5 символів).")
         return
     await state.update_data(description=message.text.strip())
+    await state.set_state(TicketForm.priority)
+    await message.answer("Оберіть пріоритет заявки:", reply_markup=priority_keyboard())
+
+
+@dp.callback_query(TicketForm.priority, F.data.startswith("pri:"))
+async def process_priority(callback: CallbackQuery, state: FSMContext) -> None:
+    val = int(callback.data.removeprefix("pri:"))
+    label = next(lbl for lbl, v in PRIORITIES.items() if v == val)
+    await state.update_data(priority=val, priority_label=label)
     await state.set_state(TicketForm.photo)
-    await message.answer(
-        "📎 Додайте фото до заявки або пропустіть:",
-        reply_markup=SKIP_PHOTO_MENU,
-    )
+    await callback.message.edit_text(f"Пріоритет: {label}")
+    await callback.message.answer("📎 Додайте фото до заявки або пропустіть:", reply_markup=SKIP_PHOTO_MENU)
+    await callback.answer()
 
 
 async def _show_confirm(target: Message, data: dict) -> None:
     photo_label = "✅ додано" if data.get("photo_bytes") else "немає"
     phone_label = data.get("phone") or "не вказано"
+    priority_label = data.get("priority_label", "🟡 Середній")
     text = (
         f"Перевірте заявку:\n\n"
         f"📂 Категорія: {hbold(data['category'])}\n"
         f"📝 Опис: {data['description']}\n"
+        f"⚡ Пріоритет: {priority_label}\n"
         f"📎 Фото: {photo_label}\n"
         f"📱 Телефон: {phone_label}\n\n"
         "Підтвердити?"
@@ -488,6 +529,7 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
             category_id=category_id,
             telegram_user_id=callback.from_user.id,
             phone=data.get("phone"),
+            priority=data.get("priority", 3),
         )
         ticket_id = result.get("id")
         if not ticket_id:
@@ -516,11 +558,13 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
 
     username_part = f"@{user.username}" if user.username else user.full_name
     phone_part = f"\n📱 Тел: {data['phone']}" if data.get("phone") else ""
+    priority_label = data.get("priority_label", "🟡 Середній")
     await bot.send_message(
         TECHNICIANS_CHAT_ID,
         f"🆕 Нова заявка {hbold(f'#{ticket_id}')}\n"
         f"👤 Від: {username_part} (ID: {hcode(str(user.id))}){phone_part}\n"
         f"📂 Категорія: {category_name}\n"
+        f"⚡ Пріоритет: {priority_label}\n"
         f"📝 {description}\n"
         f"🔗 {ticket_url}",
     )
@@ -532,6 +576,26 @@ async def process_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text("Заявку скасовано.")
     await callback.answer()
     await bot.send_message(callback.from_user.id, "Головне меню:", reply_markup=MAIN_MENU)
+
+
+def _build_tickets_message(tickets: list[dict]) -> tuple[str, InlineKeyboardMarkup | None]:
+    lines = ["📋 <b>Ваші заявки:</b>\n"]
+    cancel_buttons = []
+    for ticket in tickets:
+        ticket_id = ticket.get("2", "?")
+        name = ticket.get("1", "—")
+        status_id = int(ticket.get("12", 0))
+        date_raw = ticket.get("19", "")
+        status_label = TICKET_STATUSES.get(status_id, f"#{status_id}")
+        date_label = date_raw[:10] if date_raw else "—"
+        lines.append(f"<b>#{ticket_id}</b> — {name}\n{status_label} | {date_label}\n")
+        if status_id in (1, 2, 3) and ticket_id != "?":
+            cancel_buttons.append([InlineKeyboardButton(
+                text=f"🗑 Скасувати #{ticket_id}",
+                callback_data=f"cancel:{ticket_id}",
+            )])
+    kb = InlineKeyboardMarkup(inline_keyboard=cancel_buttons) if cancel_buttons else None
+    return "\n".join(lines), kb
 
 
 @dp.message(F.text == "📋 Мої заявки")
@@ -548,17 +612,27 @@ async def my_tickets(message: Message) -> None:
         await wait.edit_text("У вас ще немає заявок.")
         return
 
-    lines = ["📋 <b>Ваші заявки:</b>\n"]
-    for ticket in tickets:
-        ticket_id = ticket.get("2", "?")
-        name = ticket.get("1", "—")
-        status_id = int(ticket.get("12", 0))
-        date_raw = ticket.get("19", "")
-        status_label = TICKET_STATUSES.get(status_id, f"#{status_id}")
-        date_label = date_raw[:10] if date_raw else "—"
-        lines.append(f"<b>#{ticket_id}</b> — {name}\n{status_label} | {date_label}\n")
+    text, kb = _build_tickets_message(tickets)
+    await wait.edit_text(text, reply_markup=kb)
 
-    await wait.edit_text("\n".join(lines))
+
+@dp.callback_query(F.data.startswith("cancel:"))
+async def cancel_ticket_callback(callback: CallbackQuery) -> None:
+    ticket_id = int(callback.data.removeprefix("cancel:"))
+    try:
+        await glpi.cancel_ticket(ticket_id)
+        await callback.answer(f"Заявку #{ticket_id} скасовано.", show_alert=True)
+    except Exception as e:
+        log.error("Помилка скасування заявки #%s: %s", ticket_id, e)
+        await callback.answer("❌ Не вдалося скасувати заявку.", show_alert=True)
+        return
+
+    try:
+        tickets = await glpi.get_user_tickets(callback.from_user.id)
+        text, kb = _build_tickets_message(tickets)
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
