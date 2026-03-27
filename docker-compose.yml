@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  mariadb:
+    image: mariadb:10.11
+    container_name: glpi_db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+      MARIADB_USER: ${MARIADB_USER}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/mysql
+    networks:
+      - glpi_net
+
+  glpi:
+    image: glpi/glpi:11.0.0
+    container_name: glpi_app
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      MARIADB_HOST: mariadb
+      MARIADB_PORT: 3306
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+      MARIADB_USER: ${MARIADB_USER}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+    volumes:
+      - ./glpi/config:/var/www/html/config
+      - ./glpi/files:/var/www/html/files
+    depends_on:
+      - mariadb
+    networks:
+      - glpi_net
+
+  bot:
+    build: ./bot
+    container_name: glpi_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - glpi
+    networks:
+      - glpi_net
+
+volumes:
+  db_data:
+
+networks:
+  glpi_net:
+    driver: bridge
