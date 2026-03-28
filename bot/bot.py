@@ -1,7 +1,8 @@
 import asyncio
-import contextlib
+import html
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import json
@@ -9,12 +10,13 @@ import re
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, StateFilter, ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -41,11 +43,7 @@ GLPI_EXTERNAL_URL: str = os.environ.get("GLPI_EXTERNAL_URL", "http://localhost:8
 GLPI_APP_TOKEN: str = os.environ["GLPI_APP_TOKEN"]
 GLPI_USER_TOKEN: str = os.environ["GLPI_USER_TOKEN"]
 
-ALLOWED_USER_IDS: set[int] = {
-    int(uid.strip())
-    for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",")
-    if uid.strip()
-}
+ALLOWED_GROUP_ID: int | None = int(os.environ["ALLOWED_GROUP_ID"]) if os.environ.get("ALLOWED_GROUP_ID") else None
 
 # Завантажується динамічно з GLPI при старті
 CATEGORIES: dict[str, int] = {}
@@ -92,6 +90,7 @@ class GLPIClient:
     def __init__(self) -> None:
         self._session_token: str | None = None
         self._http: aiohttp.ClientSession | None = None
+        self._session_lock = asyncio.Lock()
 
     @property
     def _base_headers(self) -> dict:
@@ -110,13 +109,14 @@ class GLPIClient:
         return self._http
 
     async def init_session(self) -> None:
-        http = await self._get_http()
-        headers = {**self._base_headers, "Authorization": f"user_token {GLPI_USER_TOKEN}"}
-        async with http.get(f"{GLPI_URL}/apirest.php/initSession", headers=headers) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            self._session_token = data["session_token"]
-            log.info("GLPI session ініціалізовано")
+        async with self._session_lock:
+            http = await self._get_http()
+            headers = {**self._base_headers, "Authorization": f"user_token {GLPI_USER_TOKEN}"}
+            async with http.get(f"{GLPI_URL}/apirest.php/initSession", headers=headers) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                self._session_token = data["session_token"]
+                log.info("GLPI session ініціалізовано")
 
     async def kill_session(self) -> None:
         if not self._session_token:
@@ -381,48 +381,52 @@ glpi = GLPIClient()
 # ---------------------------------------------------------------------------
 
 
-async def _delete_after(msg: Message, delay: int) -> None:
-    await asyncio.sleep(delay)
-    with contextlib.suppress(Exception):
-        await msg.delete()
+_member_cache: dict[int, tuple[bool, float]] = {}
+MEMBER_CACHE_TTL = 300  # 5 хвилин
+
+
+async def is_group_member(user_id: int) -> bool:
+    if not ALLOWED_GROUP_ID:
+        return True
+    now = time.monotonic()
+    cached = _member_cache.get(user_id)
+    if cached and now < cached[1]:
+        return cached[0]
+    try:
+        member = await bot.get_chat_member(ALLOWED_GROUP_ID, user_id)
+        result = member.status not in ("left", "kicked", "banned")
+    except Exception:
+        result = False
+    _member_cache[user_id] = (result, now + MEMBER_CACHE_TTL)
+    return result
 
 
 @dp.message.middleware()
-async def private_only_middleware(handler, event: Message, data: dict):
+async def message_middleware(handler, event: Message, data: dict):
     if event.chat.type != "private":
-        me = await bot.get_me()
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✉️ Написати боту", url=f"https://t.me/{me.username}?start=1")
-        ]])
-        sent = await event.answer(
-            "⚠️ Заявки приймаються тільки в особистих повідомленнях.",
-            reply_markup=kb,
-        )
-        asyncio.create_task(_delete_after(sent, 30))
-        asyncio.create_task(_delete_after(event, 30))
+        return
+    if not await is_group_member(event.from_user.id):
+        await event.answer("⛔ Доступ тільки для членів групи.")
         return
     return await handler(event, data)
 
 
-# @dp.message.middleware()
-# async def auth_middleware(handler, event: Message, data: dict):
-#     if ALLOWED_USER_IDS and event.from_user.id not in ALLOWED_USER_IDS:
-#         await event.answer("⛔ У вас немає доступу до цього бота.")
-#         return
-#     return await handler(event, data)
-
-
-# @dp.callback_query.middleware()
-# async def auth_callback_middleware(handler, event: CallbackQuery, data: dict):
-#     if ALLOWED_USER_IDS and event.from_user.id not in ALLOWED_USER_IDS:
-#         await event.answer("⛔ Немає доступу.", show_alert=True)
-#         return
-#     return await handler(event, data)
+@dp.callback_query.middleware()
+async def callback_middleware(handler, event: CallbackQuery, data: dict):
+    if not await is_group_member(event.from_user.id):
+        await event.answer("⛔ Доступ тільки для членів групи.", show_alert=True)
+        return
+    return await handler(event, data)
 
 
 # ---------------------------------------------------------------------------
 # Хендлери
 # ---------------------------------------------------------------------------
+
+
+@dp.my_chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
+async def bot_added_to_group(event: ChatMemberUpdated) -> None:
+    pass  # бот входить до групи мовчки
 
 
 @dp.message(Command("start"))
@@ -492,7 +496,10 @@ async def process_description(message: Message, state: FSMContext) -> None:
 @dp.callback_query(TicketForm.priority, F.data.startswith("pri:"))
 async def process_priority(callback: CallbackQuery, state: FSMContext) -> None:
     val = int(callback.data.removeprefix("pri:"))
-    label = next(lbl for lbl, v in PRIORITIES.items() if v == val)
+    label = next((lbl for lbl, v in PRIORITIES.items() if v == val), None)
+    if label is None:
+        await callback.answer("Невідомий пріоритет.", show_alert=True)
+        return
     await state.update_data(priority=val, priority_label=label)
     await state.set_state(TicketForm.photo)
     await callback.message.edit_text(f"Пріоритет: {label}")
@@ -501,13 +508,13 @@ async def process_priority(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 async def _show_confirm(target: Message, data: dict) -> None:
-    photo_label = "✅ додано" if data.get("photo_bytes") else "немає"
+    photo_label = "✅ додано" if data.get("photo_file_id") else "немає"
     phone_label = data.get("phone") or "не вказано"
     priority_label = data.get("priority_label", "🟡 Середній")
     text = (
         f"Перевірте заявку:\n\n"
         f"📂 Категорія: {hbold(data['category'])}\n"
-        f"📝 Опис: {data['description']}\n"
+        f"📝 Опис: {html.escape(data['description'])}\n"
         f"⚡ Пріоритет: {priority_label}\n"
         f"📎 Фото: {photo_label}\n"
         f"📱 Телефон: {phone_label}\n\n"
@@ -521,9 +528,8 @@ async def _show_confirm(target: Message, data: dict) -> None:
 @dp.message(TicketForm.photo, F.photo)
 async def process_photo(message: Message, state: FSMContext) -> None:
     photo = message.photo[-1]
-    file_io = await bot.download(photo.file_id)
     await state.update_data(
-        photo_bytes=file_io.read(),
+        photo_file_id=photo.file_id,
         photo_filename=f"photo_{photo.file_id[:8]}.jpg",
     )
     await state.set_state(TicketForm.phone)
@@ -583,9 +589,10 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         await bot.send_message(callback.from_user.id, "Головне меню:", reply_markup=MAIN_MENU)
         return
 
-    if data.get("photo_bytes"):
+    if data.get("photo_file_id"):
         try:
-            doc_id = await glpi.upload_document(data["photo_bytes"], data["photo_filename"])
+            file_io = await bot.download(data["photo_file_id"])
+            doc_id = await glpi.upload_document(file_io.read(), data["photo_filename"])
             await glpi.link_document_to_ticket(doc_id, ticket_id)
         except Exception as e:
             log.error("Не вдалося прикріпити фото до заявки #%s: %s", ticket_id, e)
@@ -606,9 +613,9 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         TECHNICIANS_CHAT_ID,
         f"🆕 Нова заявка {hbold(f'#{ticket_id}')}\n"
         f"👤 Від: {username_part} (ID: {hcode(str(user.id))}){phone_part}\n"
-        f"📂 Категорія: {category_name}\n"
+        f"📂 Категорія: {html.escape(category_name)}\n"
         f"⚡ Пріоритет: {priority_label}\n"
-        f"📝 {description}\n"
+        f"📝 {html.escape(description)}\n"
         f"🔗 {ticket_url}",
     )
 
@@ -631,7 +638,7 @@ def _build_tickets_message(tickets: list[dict]) -> tuple[str, InlineKeyboardMark
         date_raw = ticket.get("19", "")
         status_label = TICKET_STATUSES.get(status_id, f"#{status_id}")
         date_label = date_raw[:10] if date_raw else "—"
-        lines.append(f"<b>#{ticket_id}</b> — {name}\n{status_label} | {date_label}\n")
+        lines.append(f"<b>#{ticket_id}</b> — {html.escape(str(name))}\n{status_label} | {date_label}\n")
         if status_id in (1, 2, 3) and ticket_id != "?":
             cancel_buttons.append([InlineKeyboardButton(
                 text=f"🗑 Скасувати #{ticket_id}",
@@ -661,7 +668,11 @@ async def my_tickets(message: Message) -> None:
 
 @dp.callback_query(F.data.startswith("cancel:"))
 async def cancel_ticket_callback(callback: CallbackQuery) -> None:
-    ticket_id = int(callback.data.removeprefix("cancel:"))
+    try:
+        ticket_id = int(callback.data.removeprefix("cancel:"))
+    except ValueError:
+        await callback.answer()
+        return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Так, скасувати", callback_data=f"cancel_yes:{ticket_id}"),
         InlineKeyboardButton(text="↩ Назад", callback_data="cancel_back"),
@@ -675,7 +686,11 @@ async def cancel_ticket_callback(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("cancel_yes:"))
 async def cancel_ticket_confirm(callback: CallbackQuery) -> None:
-    ticket_id = int(callback.data.removeprefix("cancel_yes:"))
+    try:
+        ticket_id = int(callback.data.removeprefix("cancel_yes:"))
+    except ValueError:
+        await callback.answer()
+        return
     try:
         await glpi.cancel_ticket(ticket_id)
         await callback.answer(f"Заявку #{ticket_id} скасовано.", show_alert=True)
@@ -704,6 +719,7 @@ async def cancel_ticket_back(callback: CallbackQuery) -> None:
     except Exception as e:
         log.error("Помилка повернення до списку заявок: %s", e)
         await callback.answer("❌ Не вдалося оновити список.", show_alert=True)
+        return
     await callback.answer()
 
 
@@ -736,9 +752,9 @@ async def check_closed_tickets() -> None:
                     log.info("Сповіщено користувача %s про закриття заявки #%s", telegram_user_id, ticket_id)
                 except Exception as e:
                     log.warning("Не вдалося сповістити користувача %s: %s", telegram_user_id, e)
+            last_check = now
         except Exception as e:
             log.error("Помилка перевірки закритих заявок: %s", e)
-        last_check = now
 
 
 # ---------------------------------------------------------------------------
@@ -755,9 +771,12 @@ async def main() -> None:
     except Exception as e:
         log.warning("Не вдалося підключитися до GLPI при старті: %s. Буде повторна спроба при першому запиті.", e)
 
-    asyncio.create_task(check_closed_tickets())
+    _background_tasks: set = set()
+    task = asyncio.create_task(check_closed_tickets())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await glpi.close()
         await bot.session.close()
