@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import os
 from datetime import datetime, timezone
@@ -8,7 +9,7 @@ import re
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -326,6 +327,7 @@ def categories_keyboard() -> InlineKeyboardMarkup | None:
         [InlineKeyboardButton(text=name, callback_data=f"cat:{str(cat_id)}")]
         for name, cat_id in CATEGORIES.items()
     ]
+    buttons.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="form:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -333,21 +335,25 @@ PHONE_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📱 Поділитися номером", request_contact=True)],
         [KeyboardButton(text="⏭ Пропустити")],
+        [KeyboardButton(text="❌ Скасувати заявку")],
     ],
     resize_keyboard=True,
 )
 
 SKIP_PHOTO_MENU = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="⏭ Пропустити фото")]],
+    keyboard=[
+        [KeyboardButton(text="⏭ Пропустити фото")],
+        [KeyboardButton(text="❌ Скасувати заявку")],
+    ],
     resize_keyboard=True,
 )
 
 
 def priority_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=label, callback_data=f"pri:{val}")
-        for label, val in PRIORITIES.items()
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=label, callback_data=f"pri:{val}") for label, val in PRIORITIES.items()],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="form:cancel")],
+    ])
 
 
 def confirm_keyboard() -> InlineKeyboardMarkup:
@@ -375,6 +381,12 @@ glpi = GLPIClient()
 # ---------------------------------------------------------------------------
 
 
+async def _delete_after(msg: Message, delay: int) -> None:
+    await asyncio.sleep(delay)
+    with contextlib.suppress(Exception):
+        await msg.delete()
+
+
 @dp.message.middleware()
 async def private_only_middleware(handler, event: Message, data: dict):
     if event.chat.type != "private":
@@ -382,10 +394,12 @@ async def private_only_middleware(handler, event: Message, data: dict):
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✉️ Написати боту", url=f"https://t.me/{me.username}?start=1")
         ]])
-        await event.answer(
+        sent = await event.answer(
             "⚠️ Заявки приймаються тільки в особистих повідомленнях.",
             reply_markup=kb,
         )
+        asyncio.create_task(_delete_after(sent, 30))
+        asyncio.create_task(_delete_after(event, 30))
         return
     return await handler(event, data)
 
@@ -421,6 +435,20 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     )
 
 
+@dp.message(F.text == "❌ Скасувати заявку", StateFilter(TicketForm))
+async def cancel_form_reply(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Заявку скасовано.", reply_markup=MAIN_MENU)
+
+
+@dp.callback_query(F.data == "form:cancel", StateFilter(TicketForm))
+async def cancel_form_inline(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text("Заявку скасовано.")
+    await callback.message.answer("Головне меню:", reply_markup=MAIN_MENU)
+    await callback.answer()
+
+
 @dp.message(F.text == "📝 Створити заявку")
 async def start_ticket(message: Message, state: FSMContext) -> None:
     kb = categories_keyboard()
@@ -441,7 +469,10 @@ async def process_category(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(category=category_name)
     await state.set_state(TicketForm.description)
     await callback.message.edit_text(
-        f"Категорія: {hbold(category_name)}\n\nОпишіть вашу проблему:"
+        f"Категорія: {hbold(category_name)}\n\nОпишіть вашу проблему:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Скасувати", callback_data="form:cancel")
+        ]]),
     )
     await callback.answer()
 
