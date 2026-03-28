@@ -456,6 +456,8 @@ async def start_ticket(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ Категорії недоступні. Спробуйте пізніше.")
         return
     await state.set_state(TicketForm.category)
+    removal = await message.answer(".", reply_markup=ReplyKeyboardRemove())
+    await removal.delete()
     await message.answer("Оберіть категорію заявки:", reply_markup=kb)
 
 
