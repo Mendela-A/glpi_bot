@@ -35,6 +35,15 @@ services:
     networks:
       - glpi_net
 
+  redis:
+    image: redis:7-alpine
+    container_name: glpi_redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - glpi_net
+
   bot:
     build: ./bot
     container_name: glpi_bot
@@ -43,11 +52,13 @@ services:
       - .env
     depends_on:
       - glpi
+      - redis
     networks:
       - glpi_net
 
 volumes:
   db_data:
+  redis_data:
 
 networks:
   glpi_net:

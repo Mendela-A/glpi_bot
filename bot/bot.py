@@ -1,6 +1,7 @@
 import asyncio
 import html
 import logging
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -13,10 +14,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, StateFilter, ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import (
     CallbackQuery,
     ChatMemberUpdated,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -42,21 +44,25 @@ GLPI_URL: str = os.environ["GLPI_URL"].rstrip("/")
 GLPI_EXTERNAL_URL: str = os.environ.get("GLPI_EXTERNAL_URL", "http://localhost:8080").rstrip("/")
 GLPI_APP_TOKEN: str = os.environ["GLPI_APP_TOKEN"]
 GLPI_USER_TOKEN: str = os.environ["GLPI_USER_TOKEN"]
+REDIS_URL: str = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 
 ALLOWED_GROUP_ID: int | None = int(os.environ["ALLOWED_GROUP_ID"]) if os.environ.get("ALLOWED_GROUP_ID") else None
+ADMIN_CHAT_ID: int | None = int(os.environ["ADMIN_CHAT_ID"]) if os.environ.get("ADMIN_CHAT_ID") else None
 
 # Завантажується динамічно з GLPI при старті
 CATEGORIES: dict[str, int] = {}
 
 TICKET_STATUS_CLOSED = 6
 POLL_INTERVAL_SEC = 300  # 5 хвилин
+TICKETS_PER_PAGE = 5
 
-# Поля пошуку GLPI (field IDs у відповіді search API)
+# Поля пошуку GLPI (field IDs у відповіді search API для Ticket)
 GLPI_FIELD_ID = "2"
 GLPI_FIELD_NAME = "1"
 GLPI_FIELD_STATUS = "12"
 GLPI_FIELD_DATE = "19"
 GLPI_FIELD_CONTENT = "21"
+GLPI_FIELD_DATE_MOD = "5"   # date_mod Ticket
 
 TICKET_STATUSES: dict[int, str] = {
     1: "🆕 Нова",
@@ -67,15 +73,21 @@ TICKET_STATUSES: dict[int, str] = {
     6: "🔒 Закрита",
 }
 
+STATUS_NOTIFY_MESSAGES: dict[int, str] = {
+    2: "🔧 Вашу заявку {ticket} взято в роботу.",
+    5: "✅ Вашу заявку {ticket} вирішено. Очікуйте підтвердження або закриття.",
+    6: "🔒 Вашу заявку {ticket} закрито.",
+}
+
 # ---------------------------------------------------------------------------
 # FSM
 # ---------------------------------------------------------------------------
 
 
 PRIORITIES: dict[str, int] = {
-    "🟢 Низький":  2,
+    "🟢 Низький": 2,
     "🟡 Середній": 3,
-    "🔴 Високий":  4,
+    "🔴 Високий": 4,
 }
 
 
@@ -86,6 +98,10 @@ class TicketForm(StatesGroup):
     photo       = State()
     phone       = State()
     confirm     = State()
+
+
+class FollowupForm(StatesGroup):
+    reply = State()
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +202,10 @@ class GLPIClient:
             resp.raise_for_status()
             return await resp.json()
 
-    async def get_user_tickets(self, user_id: int) -> list[dict]:
-        """Повертає заявки користувача за міткою [tg:user_id] в content."""
+    async def get_user_tickets(
+        self, user_id: int, offset: int = 0, limit: int = TICKETS_PER_PAGE
+    ) -> tuple[list[dict], int]:
+        """Повертає (заявки, totalcount) за міткою [tg:user_id] в content."""
         params = {
             "criteria[0][field]": GLPI_FIELD_CONTENT,
             "criteria[0][searchtype]": "contains",
@@ -197,15 +215,15 @@ class GLPIClient:
             "forcedisplay[2]": GLPI_FIELD_DATE,
             "sort": GLPI_FIELD_DATE,
             "order": "DESC",
-            "range": "0-20",
+            "range": f"{offset}-{offset + limit - 1}",
         }
         async with await self._request(
             "GET", f"{GLPI_URL}/apirest.php/search/Ticket", params=params
         ) as resp:
             if resp.status in (200, 206):
                 data = await resp.json()
-                return data.get("data", [])
-            return []
+                return data.get("data", []), data.get("totalcount", 0)
+            return [], 0
 
     async def get_categories(self) -> dict[str, int]:
         """Повертає словник {назва: id} категорій з GLPI."""
@@ -222,18 +240,21 @@ class GLPIClient:
                 and item.get("is_helpdeskvisible") == 1
             }
 
-    async def get_recently_closed_tickets(self, since: datetime) -> list[dict]:
-        """Повертає заявки зі статусом Closed, закриті після `since`."""
+    async def get_tickets_changed_since(self, since: datetime, status: int) -> list[dict]:
+        """Заявки з вказаним статусом, змінені після `since`, що містять [tg:."""
         params = {
             "criteria[0][field]": GLPI_FIELD_STATUS,
             "criteria[0][searchtype]": "equals",
-            "criteria[0][value]": str(TICKET_STATUS_CLOSED),
-            "criteria[1][field]": "17",          # closedate
+            "criteria[0][value]": str(status),
+            "criteria[1][field]": GLPI_FIELD_DATE_MOD,
             "criteria[1][searchtype]": "morethan",
             "criteria[1][value]": since.strftime("%Y-%m-%d %H:%M:%S"),
-            "forcedisplay[0]": GLPI_FIELD_NAME,
-            "forcedisplay[1]": GLPI_FIELD_STATUS,
-            "forcedisplay[2]": "17",             # closedate
+            "criteria[2][field]": GLPI_FIELD_CONTENT,
+            "criteria[2][searchtype]": "contains",
+            "criteria[2][value]": "[tg:",
+            "forcedisplay[0]": GLPI_FIELD_ID,
+            "forcedisplay[1]": GLPI_FIELD_NAME,
+            "forcedisplay[2]": GLPI_FIELD_STATUS,
             "forcedisplay[3]": GLPI_FIELD_CONTENT,
             "range": "0-50",
         }
@@ -241,9 +262,59 @@ class GLPIClient:
             "GET", f"{GLPI_URL}/apirest.php/search/Ticket", params=params
         ) as resp:
             if resp.status in (200, 206):
-                data = await resp.json()
-                return data.get("data", [])
+                return (await resp.json()).get("data", [])
             return []
+
+    async def get_ticket(self, ticket_id: int) -> dict:
+        """Повний об'єкт заявки."""
+        async with await self._request("GET", f"{GLPI_URL}/apirest.php/Ticket/{ticket_id}") as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+    async def get_ticket_followups(self, ticket_id: int) -> list[dict]:
+        """Follow-up коментарі до заявки."""
+        async with await self._request(
+            "GET", f"{GLPI_URL}/apirest.php/Ticket/{ticket_id}/ITILFollowup"
+        ) as resp:
+            if resp.status in (200, 206):
+                data = await resp.json()
+                return data if isinstance(data, list) else []
+            return []
+
+    async def get_recent_followups(self, since: datetime) -> list[dict]:
+        """Follow-ups, створені після `since`.
+
+        Поля відповіді: "2"=id, "3"=items_id (ticket_id), "4"=content, "5"=date_creation.
+        """
+        params = {
+            "criteria[0][field]": "5",   # date_creation ITILFollowup
+            "criteria[0][searchtype]": "morethan",
+            "criteria[0][value]": since.strftime("%Y-%m-%d %H:%M:%S"),
+            "forcedisplay[0]": "2",      # id
+            "forcedisplay[1]": "3",      # items_id (ticket_id)
+            "forcedisplay[2]": "4",      # content
+            "forcedisplay[3]": "5",      # date_creation
+            "range": "0-50",
+        }
+        async with await self._request(
+            "GET", f"{GLPI_URL}/apirest.php/search/ITILFollowup", params=params
+        ) as resp:
+            if resp.status in (200, 206):
+                return (await resp.json()).get("data", [])
+            return []
+
+    async def add_followup(self, ticket_id: int, content: str) -> None:
+        """Додає публічний follow-up до заявки."""
+        payload = {"input": {
+            "itemtype": "Ticket",
+            "items_id": ticket_id,
+            "content": content,
+            "is_private": 0,
+        }}
+        async with await self._request(
+            "POST", f"{GLPI_URL}/apirest.php/Ticket/{ticket_id}/ITILFollowup", json=payload
+        ) as resp:
+            resp.raise_for_status()
 
     async def upload_document(self, file_bytes: bytes, filename: str) -> int:
         """Завантажує файл у GLPI і повертає document id.
@@ -352,13 +423,66 @@ def confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def tickets_keyboard(
+    tickets: list[dict], offset: int, total: int
+) -> InlineKeyboardMarkup | None:
+    """Inline-клавіатура для списку заявок з пагінацією."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for ticket in tickets:
+        ticket_id = ticket.get(GLPI_FIELD_ID, "?")
+        status_id = int(ticket.get(GLPI_FIELD_STATUS, 0))
+        row = [InlineKeyboardButton(
+            text=f"🔍 #{ticket_id}",
+            callback_data=f"tdetail:{ticket_id}",
+        )]
+        if status_id in (1, 2, 3) and ticket_id != "?":
+            row.append(InlineKeyboardButton(
+                text=f"🗑 Скасувати",
+                callback_data=f"cancel:{ticket_id}",
+            ))
+        rows.append(row)
+
+    # Навігація
+    total_pages = math.ceil(total / TICKETS_PER_PAGE) or 1
+    current_page = offset // TICKETS_PER_PAGE + 1
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(text="← Назад", callback_data=f"mytickets:{offset - TICKETS_PER_PAGE}"))
+    nav.append(InlineKeyboardButton(text=f"{current_page}/{total_pages}", callback_data="noop"))
+    if offset + TICKETS_PER_PAGE < total:
+        nav.append(InlineKeyboardButton(text="Далі →", callback_data=f"mytickets:{offset + TICKETS_PER_PAGE}"))
+    if len(nav) > 1:  # показуємо навігацію тільки якщо є куди переходити
+        rows.append(nav)
+
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
 # ---------------------------------------------------------------------------
 # Telegram Bot + Dispatcher
 # ---------------------------------------------------------------------------
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher(storage=RedisStorage.from_url(REDIS_URL))
 glpi = GLPIClient()
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+_rate_limit: dict[int, list[float]] = {}
+RATE_LIMIT_REQUESTS = 10
+RATE_LIMIT_WINDOW = 60  # секунд
+
+
+def _is_rate_limited(user_id: int) -> bool:
+    now = time.monotonic()
+    history = [t for t in _rate_limit.get(user_id, []) if now - t < RATE_LIMIT_WINDOW]
+    _rate_limit[user_id] = history
+    if len(history) >= RATE_LIMIT_REQUESTS:
+        return True
+    history.append(now)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +517,9 @@ async def message_middleware(handler, event: Message, data: dict):
     if not await is_group_member(event.from_user.id):
         await event.answer("⛔ Доступ тільки для членів групи.")
         return
+    if _is_rate_limited(event.from_user.id):
+        await event.answer("⚠️ Занадто багато запитів. Зачекайте хвилину.")
+        return
     return await handler(event, data)
 
 
@@ -400,6 +527,9 @@ async def message_middleware(handler, event: Message, data: dict):
 async def callback_middleware(handler, event: CallbackQuery, data: dict):
     if not await is_group_member(event.from_user.id):
         await event.answer("⛔ Доступ тільки для членів групи.", show_alert=True)
+        return
+    if _is_rate_limited(event.from_user.id):
+        await event.answer("⚠️ Занадто багато запитів.", show_alert=True)
         return
     return await handler(event, data)
 
@@ -422,6 +552,17 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "Я допоможу вам створити заявку в IT-відділ.",
         reply_markup=MAIN_MENU,
     )
+
+
+@dp.message(Command("cancel"), StateFilter(TicketForm, FollowupForm))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Скасовано.", reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel_noop(message: Message) -> None:
+    await message.answer("Немає активної дії для скасування.", reply_markup=MAIN_MENU)
 
 
 @dp.message(F.text == "❌ Скасувати заявку", StateFilter(TicketForm))
@@ -628,9 +769,13 @@ async def process_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await bot.send_message(callback.from_user.id, "Головне меню:", reply_markup=MAIN_MENU)
 
 
-def _build_tickets_message(tickets: list[dict]) -> tuple[str, InlineKeyboardMarkup | None]:
+# ---------------------------------------------------------------------------
+# Список заявок + пагінація
+# ---------------------------------------------------------------------------
+
+
+def _build_tickets_message(tickets: list[dict]) -> str:
     lines = ["📋 <b>Ваші заявки:</b>\n"]
-    cancel_buttons = []
     for ticket in tickets:
         ticket_id = ticket.get(GLPI_FIELD_ID, "?")
         name = ticket.get(GLPI_FIELD_NAME, "—")
@@ -639,20 +784,14 @@ def _build_tickets_message(tickets: list[dict]) -> tuple[str, InlineKeyboardMark
         status_label = TICKET_STATUSES.get(status_id, f"#{status_id}")
         date_label = date_raw[:10] if date_raw else "—"
         lines.append(f"<b>#{ticket_id}</b> — {html.escape(str(name))}\n{status_label} | {date_label}\n")
-        if status_id in (1, 2, 3) and ticket_id != "?":
-            cancel_buttons.append([InlineKeyboardButton(
-                text=f"🗑 Скасувати #{ticket_id}",
-                callback_data=f"cancel:{ticket_id}",
-            )])
-    kb = InlineKeyboardMarkup(inline_keyboard=cancel_buttons) if cancel_buttons else None
-    return "\n".join(lines), kb
+    return "\n".join(lines)
 
 
 @dp.message(F.text == "📋 Мої заявки")
 async def my_tickets(message: Message) -> None:
     wait = await message.answer("⏳ Завантажую ваші заявки...")
     try:
-        tickets = await glpi.get_user_tickets(message.from_user.id)
+        tickets, total = await glpi.get_user_tickets(message.from_user.id, offset=0)
     except Exception as e:
         log.error("Помилка отримання заявок: %s", e)
         await wait.edit_text("❌ Не вдалося отримати заявки. Спробуйте пізніше.")
@@ -662,8 +801,89 @@ async def my_tickets(message: Message) -> None:
         await wait.edit_text("У вас ще немає заявок.")
         return
 
-    text, kb = _build_tickets_message(tickets)
+    text = _build_tickets_message(tickets)
+    kb = tickets_keyboard(tickets, offset=0, total=total)
     await wait.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("mytickets:"))
+async def tickets_page(callback: CallbackQuery) -> None:
+    try:
+        offset = int(callback.data.removeprefix("mytickets:"))
+    except ValueError:
+        await callback.answer()
+        return
+    try:
+        tickets, total = await glpi.get_user_tickets(callback.from_user.id, offset=offset)
+    except Exception as e:
+        log.error("Помилка пагінації заявок: %s", e)
+        await callback.answer("❌ Не вдалося завантажити заявки.", show_alert=True)
+        return
+    if not tickets:
+        await callback.message.edit_text("У вас ще немає заявок.")
+        await callback.answer()
+        return
+    text = _build_tickets_message(tickets)
+    kb = tickets_keyboard(tickets, offset=offset, total=total)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Деталі заявки
+# ---------------------------------------------------------------------------
+
+
+@dp.callback_query(F.data.startswith("tdetail:"))
+async def ticket_detail(callback: CallbackQuery) -> None:
+    try:
+        ticket_id = int(callback.data.removeprefix("tdetail:"))
+    except ValueError:
+        await callback.answer()
+        return
+    try:
+        ticket = await glpi.get_ticket(ticket_id)
+        followups = await glpi.get_ticket_followups(ticket_id)
+    except Exception as e:
+        log.error("Помилка отримання деталей заявки #%s: %s", ticket_id, e)
+        await callback.answer("❌ Не вдалося завантажити деталі.", show_alert=True)
+        return
+
+    status_id = ticket.get("status", 0)
+    status_label = TICKET_STATUSES.get(status_id, f"#{status_id}")
+    date_open = (ticket.get("date") or ticket.get("date_creation") or "")[:10]
+    date_mod = (ticket.get("date_mod") or "")[:10]
+    content = html.escape(str(ticket.get("content") or "—"))
+
+    lines = [
+        f"📋 <b>Заявка #{ticket_id}</b>\n",
+        f"📝 {html.escape(str(ticket.get('name', '—')))}",
+        f"{status_label} | відкрито: {date_open} | змінено: {date_mod}",
+        f"\n<b>Опис:</b>\n{content[:500]}",
+    ]
+
+    if followups:
+        lines.append("\n<b>Коментарі техніка:</b>")
+        for fu in followups[-3:]:  # останні 3
+            fu_content = html.escape(str(fu.get("content") or ""))[:300]
+            fu_date = (fu.get("date_creation") or "")[:10]
+            lines.append(f"[{fu_date}] {fu_content}")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="↩ До списку", callback_data="mytickets:0")
+    ]])
+    await callback.message.edit_text("\n".join(lines), reply_markup=kb)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Скасування заявки
+# ---------------------------------------------------------------------------
 
 
 @dp.callback_query(F.data.startswith("cancel:"))
@@ -675,7 +895,7 @@ async def cancel_ticket_callback(callback: CallbackQuery) -> None:
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Так, скасувати", callback_data=f"cancel_yes:{ticket_id}"),
-        InlineKeyboardButton(text="↩ Назад", callback_data="cancel_back"),
+        InlineKeyboardButton(text="↩ Назад", callback_data="mytickets:0"),
     ]])
     await callback.message.edit_text(
         f"Скасувати заявку <b>#{ticket_id}</b>? Цю дію не можна відмінити.",
@@ -694,7 +914,7 @@ async def cancel_ticket_confirm(callback: CallbackQuery) -> None:
 
     # Перевірка власника: заявка має належати поточному користувачу
     try:
-        user_tickets = await glpi.get_user_tickets(callback.from_user.id)
+        user_tickets, _ = await glpi.get_user_tickets(callback.from_user.id, offset=0, limit=20)
     except Exception as e:
         log.error("Помилка перевірки заявок при скасуванні: %s", e)
         await callback.answer("❌ Не вдалося перевірити заявку.", show_alert=True)
@@ -714,62 +934,181 @@ async def cancel_ticket_confirm(callback: CallbackQuery) -> None:
         return
 
     try:
-        # user_tickets вже отримані вище, але потрібно оновити список після скасування
-        tickets = await glpi.get_user_tickets(callback.from_user.id)
-        text, kb = _build_tickets_message(tickets)
+        tickets, total = await glpi.get_user_tickets(callback.from_user.id, offset=0)
+        text = _build_tickets_message(tickets)
+        kb = tickets_keyboard(tickets, offset=0, total=total)
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception:
         pass
 
 
-@dp.callback_query(F.data == "cancel_back")
-async def cancel_ticket_back(callback: CallbackQuery) -> None:
+# ---------------------------------------------------------------------------
+# Follow-up: відповідь користувача на коментар техніка
+# ---------------------------------------------------------------------------
+
+
+@dp.callback_query(F.data.startswith("fu_reply:"))
+async def followup_reply_start(callback: CallbackQuery, state: FSMContext) -> None:
     try:
-        tickets = await glpi.get_user_tickets(callback.from_user.id)
-        if tickets:
-            text, kb = _build_tickets_message(tickets)
-        else:
-            text, kb = "У вас ще немає заявок.", None
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception as e:
-        log.error("Помилка повернення до списку заявок: %s", e)
-        await callback.answer("❌ Не вдалося оновити список.", show_alert=True)
+        ticket_id = int(callback.data.removeprefix("fu_reply:"))
+    except ValueError:
+        await callback.answer()
         return
+    await state.set_state(FollowupForm.reply)
+    await state.update_data(ticket_id=ticket_id)
+    await callback.message.answer(
+        f"✏️ Введіть відповідь до заявки <b>#{ticket_id}</b>:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Скасувати заявку")]],
+            resize_keyboard=True,
+        ),
+    )
     await callback.answer()
 
 
+@dp.message(FollowupForm.reply, F.text)
+async def followup_reply_send(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    ticket_id = data["ticket_id"]
+    try:
+        await glpi.add_followup(ticket_id, message.text)
+        await state.clear()
+        await message.answer(
+            f"✅ Відповідь до заявки #{ticket_id} надіслано.", reply_markup=MAIN_MENU
+        )
+    except Exception as e:
+        log.error("Помилка надсилання follow-up до #%s: %s", ticket_id, e)
+        await message.answer("❌ Не вдалося надіслати відповідь. Спробуйте ще раз.")
+
+
+@dp.message(FollowupForm.reply)
+async def followup_reply_invalid(message: Message) -> None:
+    await message.answer("✏️ Введіть текстову відповідь.")
+
+
 # ---------------------------------------------------------------------------
-# Polling закритих заявок
+# Глобальний error handler
 # ---------------------------------------------------------------------------
 
 
-async def check_closed_tickets() -> None:
+@dp.error()
+async def global_error_handler(event: ErrorEvent) -> None:
+    log.exception("Необроблений виняток", exc_info=event.exception)
+    if ADMIN_CHAT_ID:
+        exc = event.exception
+        try:
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                f"❌ <b>Помилка бота</b>\n"
+                f"{html.escape(type(exc).__name__)}: {html.escape(str(exc)[:400])}",
+            )
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Polling оновлень заявок
+# ---------------------------------------------------------------------------
+
+_notified_statuses: dict[int, int] = {}   # {ticket_id: last_notified_status}
+_notified_followups: set[int] = set()     # follow-up IDs
+
+
+async def _notify_status_changes(since: datetime) -> None:
+    for status in (2, 5, 6):
+        try:
+            tickets = await glpi.get_tickets_changed_since(since, status)
+        except Exception as e:
+            log.error("Помилка отримання змін статусу %s: %s", status, e)
+            continue
+
+        for ticket in tickets:
+            ticket_id_raw = ticket.get(GLPI_FIELD_ID)
+            try:
+                ticket_id = int(ticket_id_raw)
+            except (TypeError, ValueError):
+                continue
+
+            if _notified_statuses.get(ticket_id) == status:
+                continue  # вже сповіщали про цей статус
+
+            content = ticket.get(GLPI_FIELD_CONTENT, "")
+            match = re.search(r'\[tg:(\d+)\]', content)
+            if not match:
+                continue
+            telegram_user_id = int(match.group(1))
+            ticket_name = ticket.get(GLPI_FIELD_NAME, "—")
+            bold_ticket = hbold(f"#{ticket_id} «{ticket_name}»")
+            msg = STATUS_NOTIFY_MESSAGES[status].format(ticket=bold_ticket)
+            try:
+                await bot.send_message(telegram_user_id, msg)
+                _notified_statuses[ticket_id] = status
+                log.info("Сповіщено %s про статус %s заявки #%s", telegram_user_id, status, ticket_id)
+            except Exception as e:
+                log.warning("Не вдалося сповістити %s: %s", telegram_user_id, e)
+
+
+async def _notify_new_followups(since: datetime) -> None:
+    try:
+        followups = await glpi.get_recent_followups(since)
+    except Exception as e:
+        log.error("Помилка отримання follow-ups: %s", e)
+        return
+
+    for fu in followups:
+        fu_id_raw = fu.get("2")
+        try:
+            fu_id = int(fu_id_raw)
+        except (TypeError, ValueError):
+            continue
+
+        if fu_id in _notified_followups:
+            continue
+
+        ticket_id_raw = fu.get("3")
+        fu_content = str(fu.get("4") or "")
+
+        try:
+            ticket_id = int(ticket_id_raw)
+            ticket = await glpi.get_ticket(ticket_id)
+        except Exception as e:
+            log.warning("Не вдалося отримати заявку #%s для follow-up: %s", ticket_id_raw, e)
+            continue
+
+        ticket_content = ticket.get("content", "")
+        match = re.search(r'\[tg:(\d+)\]', ticket_content)
+        if not match:
+            _notified_followups.add(fu_id)  # не наша заявка — більше не перевіряємо
+            continue
+
+        telegram_user_id = int(match.group(1))
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✏️ Відповісти", callback_data=f"fu_reply:{ticket_id}")
+        ]])
+        try:
+            await bot.send_message(
+                telegram_user_id,
+                f"💬 Новий коментар техніка до заявки {hbold(f'#{ticket_id}')}:\n\n"
+                f"{html.escape(fu_content[:800])}",
+                reply_markup=kb,
+            )
+            _notified_followups.add(fu_id)
+            log.info("Сповіщено %s про follow-up #%s заявки #%s", telegram_user_id, fu_id, ticket_id)
+        except Exception as e:
+            log.warning("Не вдалося сповістити %s про follow-up: %s", telegram_user_id, e)
+
+
+async def check_ticket_updates() -> None:
     last_check = datetime.now(timezone.utc)
     while True:
         await asyncio.sleep(POLL_INTERVAL_SEC)
         now = datetime.now(timezone.utc)
         try:
-            tickets = await glpi.get_recently_closed_tickets(since=last_check)
-            for ticket in tickets:
-                ticket_id   = ticket.get(GLPI_FIELD_ID) or ticket.get("id", "?")
-                ticket_name = ticket.get(GLPI_FIELD_NAME) or ticket.get("name", "—")
-                content     = ticket.get(GLPI_FIELD_CONTENT, "")
-                match = re.search(r'\[tg:(\d+)\]', content)
-                if not match:
-                    continue  # заявка не з бота — пропускаємо
-                telegram_user_id = int(match.group(1))
-                try:
-                    await bot.send_message(
-                        telegram_user_id,
-                        f"✅ Вашу заявку {hbold(f'#{ticket_id}')} закрито.\n"
-                        f"📂 {ticket_name}",
-                    )
-                    log.info("Сповіщено користувача %s про закриття заявки #%s", telegram_user_id, ticket_id)
-                except Exception as e:
-                    log.warning("Не вдалося сповістити користувача %s: %s", telegram_user_id, e)
-            last_check = now
+            await _notify_status_changes(last_check)
+            await _notify_new_followups(last_check)
         except Exception as e:
-            log.error("Помилка перевірки закритих заявок: %s", e)
+            log.error("Помилка перевірки оновлень заявок: %s", e)
+        last_check = now
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +1126,7 @@ async def main() -> None:
         log.warning("Не вдалося підключитися до GLPI при старті: %s. Буде повторна спроба при першому запиті.", e)
 
     _background_tasks: set = set()
-    task = asyncio.create_task(check_closed_tickets())
+    task = asyncio.create_task(check_ticket_updates())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     try:
