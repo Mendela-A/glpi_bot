@@ -51,6 +51,13 @@ CATEGORIES: dict[str, int] = {}
 TICKET_STATUS_CLOSED = 6
 POLL_INTERVAL_SEC = 300  # 5 хвилин
 
+# Поля пошуку GLPI (field IDs у відповіді search API)
+GLPI_FIELD_ID = "2"
+GLPI_FIELD_NAME = "1"
+GLPI_FIELD_STATUS = "12"
+GLPI_FIELD_DATE = "19"
+GLPI_FIELD_CONTENT = "21"
+
 TICKET_STATUSES: dict[int, str] = {
     1: "🆕 Нова",
     2: "🔧 В роботі",
@@ -135,9 +142,32 @@ class GLPIClient:
         if not self._session_token:
             await self.init_session()
 
-    async def create_ticket(self, name: str, content: str, category_id: int, telegram_user_id: int, phone: str | None = None, priority: int = 3) -> dict:
+    async def _request(self, method: str, url: str, **kwargs) -> aiohttp.ClientResponse:
+        """Виконує HTTP-запит з автоматичним retry при 401.
+
+        Увага: не використовувати для multipart/form-data — тіло запиту вже
+        буде прочитано і не може бути надіслане повторно.
+        """
         await self._ensure_session()
         http = await self._get_http()
+        headers = kwargs.pop("headers", self._auth_headers)
+        resp = await http.request(method, url, headers=headers, **kwargs)
+        if resp.status == 401:
+            resp.release()  # звільняємо з'єднання перед повторним запитом
+            await self.init_session()
+            headers = {**headers, "Session-Token": self._session_token or ""}
+            resp = await http.request(method, url, headers=headers, **kwargs)
+        return resp
+
+    async def create_ticket(
+        self,
+        name: str,
+        content: str,
+        category_id: int,
+        telegram_user_id: int,
+        phone: str | None = None,
+        priority: int = 3,
+    ) -> dict:
         extra = f"\nТелефон: {phone}" if phone else ""
         tagged_content = f"{content}{extra}\n\n[tg:{telegram_user_id}]"
         payload = {
@@ -152,46 +182,26 @@ class GLPIClient:
                 "requesttypes_id": 7,  # Telegram Bot
             }
         }
-        async with http.post(
-            f"{GLPI_URL}/apirest.php/Ticket",
-            json=payload,
-            headers=self._auth_headers,
-        ) as resp:
-            if resp.status == 401:
-                await self.init_session()
-                async with http.post(
-                    f"{GLPI_URL}/apirest.php/Ticket",
-                    json=payload,
-                    headers=self._auth_headers,
-                ) as retry:
-                    retry.raise_for_status()
-                    return await retry.json()
+        async with await self._request("POST", f"{GLPI_URL}/apirest.php/Ticket", json=payload) as resp:
             resp.raise_for_status()
             return await resp.json()
 
     async def get_user_tickets(self, user_id: int) -> list[dict]:
         """Повертає заявки користувача за міткою [tg:user_id] в content."""
-        await self._ensure_session()
-        http = await self._get_http()
         params = {
-            "criteria[0][field]": "21",           # content
+            "criteria[0][field]": GLPI_FIELD_CONTENT,
             "criteria[0][searchtype]": "contains",
             "criteria[0][value]": f"[tg:{user_id}]",
-            "forcedisplay[0]": "2",               # name
-            "forcedisplay[1]": "12",              # status
-            "forcedisplay[2]": "19",              # date_creation
-            "sort": "19",
+            "forcedisplay[0]": GLPI_FIELD_NAME,
+            "forcedisplay[1]": GLPI_FIELD_STATUS,
+            "forcedisplay[2]": GLPI_FIELD_DATE,
+            "sort": GLPI_FIELD_DATE,
             "order": "DESC",
             "range": "0-20",
         }
-        async with http.get(
-            f"{GLPI_URL}/apirest.php/search/Ticket",
-            params=params,
-            headers=self._auth_headers,
+        async with await self._request(
+            "GET", f"{GLPI_URL}/apirest.php/search/Ticket", params=params
         ) as resp:
-            if resp.status == 401:
-                await self.init_session()
-                return await self.get_user_tickets(user_id)
             if resp.status in (200, 206):
                 data = await resp.json()
                 return data.get("data", [])
@@ -199,16 +209,9 @@ class GLPIClient:
 
     async def get_categories(self) -> dict[str, int]:
         """Повертає словник {назва: id} категорій з GLPI."""
-        await self._ensure_session()
-        http = await self._get_http()
-        async with http.get(
-            f"{GLPI_URL}/apirest.php/ITILCategory",
-            params={"range": "0-200"},
-            headers=self._auth_headers,
+        async with await self._request(
+            "GET", f"{GLPI_URL}/apirest.php/ITILCategory", params={"range": "0-200"}
         ) as resp:
-            if resp.status == 401:
-                await self.init_session()
-                return await self.get_categories()
             resp.raise_for_status()
             data = await resp.json()
             return {
@@ -221,84 +224,64 @@ class GLPIClient:
 
     async def get_recently_closed_tickets(self, since: datetime) -> list[dict]:
         """Повертає заявки зі статусом Closed, закриті після `since`."""
-        await self._ensure_session()
-        http = await self._get_http()
         params = {
-            "criteria[0][field]": "12",          # status field
+            "criteria[0][field]": GLPI_FIELD_STATUS,
             "criteria[0][searchtype]": "equals",
             "criteria[0][value]": str(TICKET_STATUS_CLOSED),
             "criteria[1][field]": "17",          # closedate
             "criteria[1][searchtype]": "morethan",
             "criteria[1][value]": since.strftime("%Y-%m-%d %H:%M:%S"),
-            "forcedisplay[0]": "2",              # name
-            "forcedisplay[1]": "12",             # status
+            "forcedisplay[0]": GLPI_FIELD_NAME,
+            "forcedisplay[1]": GLPI_FIELD_STATUS,
             "forcedisplay[2]": "17",             # closedate
-            "forcedisplay[3]": "21",             # content (містить [tg:USER_ID])
+            "forcedisplay[3]": GLPI_FIELD_CONTENT,
             "range": "0-50",
         }
-        async with http.get(
-            f"{GLPI_URL}/apirest.php/search/Ticket",
-            params=params,
-            headers=self._auth_headers,
+        async with await self._request(
+            "GET", f"{GLPI_URL}/apirest.php/search/Ticket", params=params
         ) as resp:
-            if resp.status == 401:
-                await self.init_session()
-                return await self.get_recently_closed_tickets(since)
-            if resp.status == 206 or resp.status == 200:
+            if resp.status in (200, 206):
                 data = await resp.json()
                 return data.get("data", [])
             return []
 
     async def upload_document(self, file_bytes: bytes, filename: str) -> int:
-        """Завантажує файл у GLPI і повертає document id."""
+        """Завантажує файл у GLPI і повертає document id.
+
+        Не використовує _request — FormData не можна надіслати двічі після 401.
+        """
         await self._ensure_session()
         http = await self._get_http()
         manifest = json.dumps({"input": {"name": filename, "_filename": [filename]}})
         form = aiohttp.FormData()
         form.add_field("uploadManifest", manifest, content_type="application/json")
         form.add_field("filename[0]", file_bytes, filename=filename, content_type="image/jpeg")
+        # Для multipart не передаємо Content-Type — aiohttp встановить boundary сам
         headers = {k: v for k, v in self._auth_headers.items() if k != "Content-Type"}
         async with http.post(
             f"{GLPI_URL}/apirest.php/Document",
             data=form,
             headers=headers,
         ) as resp:
-            if resp.status == 401:
-                await self.init_session()
-                return await self.upload_document(file_bytes, filename)
             resp.raise_for_status()
             data = await resp.json()
             return data["id"]
 
     async def link_document_to_ticket(self, doc_id: int, ticket_id: int) -> None:
         """Прив'язує документ до тікету."""
-        await self._ensure_session()
-        http = await self._get_http()
         payload = {"input": {"documents_id": doc_id, "items_id": ticket_id, "itemtype": "Ticket"}}
-        async with http.post(
-            f"{GLPI_URL}/apirest.php/Document_Item",
-            json=payload,
-            headers=self._auth_headers,
+        async with await self._request(
+            "POST", f"{GLPI_URL}/apirest.php/Document_Item", json=payload
         ) as resp:
-            if resp.status == 401:
-                await self.init_session()
-                await self.link_document_to_ticket(doc_id, ticket_id)
-                return
             resp.raise_for_status()
 
     async def cancel_ticket(self, ticket_id: int) -> None:
-        """Закриває заявку (status=6)."""
-        await self._ensure_session()
-        http = await self._get_http()
-        async with http.put(
+        """Закриває заявку (status=TICKET_STATUS_CLOSED)."""
+        async with await self._request(
+            "PUT",
             f"{GLPI_URL}/apirest.php/Ticket/{ticket_id}",
-            json={"input": {"status": 6}},
-            headers=self._auth_headers,
+            json={"input": {"status": TICKET_STATUS_CLOSED}},
         ) as resp:
-            if resp.status == 401:
-                await self.init_session()
-                await self.cancel_ticket(ticket_id)
-                return
             resp.raise_for_status()
 
     async def close(self) -> None:
@@ -323,10 +306,12 @@ MAIN_MENU = ReplyKeyboardMarkup(
 def categories_keyboard() -> InlineKeyboardMarkup | None:
     if not CATEGORIES:
         return None
-    buttons = [
-        [InlineKeyboardButton(text=name, callback_data=f"cat:{str(cat_id)}")]
+    items = [
+        InlineKeyboardButton(text=name, callback_data=f"cat:{cat_id}")
         for name, cat_id in CATEGORIES.items()
     ]
+    # По 2 кнопки в рядок для компактності
+    buttons = [items[i:i + 2] for i in range(0, len(items), 2)]
     buttons.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="form:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -483,14 +468,19 @@ async def process_category(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@dp.message(TicketForm.description)
+@dp.message(TicketForm.description, F.text)
 async def process_description(message: Message, state: FSMContext) -> None:
-    if not message.text or len(message.text.strip()) < 5:
+    if len(message.text.strip()) < 5:
         await message.answer("Будь ласка, опишіть проблему детальніше (мінімум 5 символів).")
         return
     await state.update_data(description=message.text.strip())
     await state.set_state(TicketForm.priority)
     await message.answer("Оберіть пріоритет заявки:", reply_markup=priority_keyboard())
+
+
+@dp.message(TicketForm.description)
+async def description_invalid(message: Message) -> None:
+    await message.answer("✏️ Введіть текстовий опис проблеми.")
 
 
 @dp.callback_query(TicketForm.priority, F.data.startswith("pri:"))
@@ -542,6 +532,11 @@ async def skip_photo(message: Message, state: FSMContext) -> None:
     await message.answer("📱 Вкажіть номер для зворотного зв'язку:", reply_markup=PHONE_MENU)
 
 
+@dp.message(TicketForm.photo)
+async def photo_invalid(message: Message) -> None:
+    await message.answer("📷 Надішліть фото або натисніть '⏭ Пропустити фото'.")
+
+
 @dp.message(TicketForm.phone, F.contact)
 async def process_phone(message: Message, state: FSMContext) -> None:
     await state.update_data(phone=message.contact.phone_number)
@@ -555,6 +550,11 @@ async def skip_phone(message: Message, state: FSMContext) -> None:
     await state.set_state(TicketForm.confirm)
     data = await state.get_data()
     await _show_confirm(message, data)
+
+
+@dp.message(TicketForm.phone)
+async def phone_invalid(message: Message) -> None:
+    await message.answer("📱 Натисніть '📱 Поділитися номером' або '⏭ Пропустити'.")
 
 
 @dp.callback_query(TicketForm.confirm, F.data == "confirm:yes")
@@ -571,7 +571,7 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
 
     try:
         result = await glpi.create_ticket(
-            name=f"{category_name}: {description[:60]}",
+            name=description[:80],
             content=description,
             category_id=category_id,
             telegram_user_id=callback.from_user.id,
@@ -632,10 +632,10 @@ def _build_tickets_message(tickets: list[dict]) -> tuple[str, InlineKeyboardMark
     lines = ["📋 <b>Ваші заявки:</b>\n"]
     cancel_buttons = []
     for ticket in tickets:
-        ticket_id = ticket.get("2", "?")
-        name = ticket.get("1", "—")
-        status_id = int(ticket.get("12", 0))
-        date_raw = ticket.get("19", "")
+        ticket_id = ticket.get(GLPI_FIELD_ID, "?")
+        name = ticket.get(GLPI_FIELD_NAME, "—")
+        status_id = int(ticket.get(GLPI_FIELD_STATUS, 0))
+        date_raw = ticket.get(GLPI_FIELD_DATE, "")
         status_label = TICKET_STATUSES.get(status_id, f"#{status_id}")
         date_label = date_raw[:10] if date_raw else "—"
         lines.append(f"<b>#{ticket_id}</b> — {html.escape(str(name))}\n{status_label} | {date_label}\n")
@@ -691,6 +691,20 @@ async def cancel_ticket_confirm(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer()
         return
+
+    # Перевірка власника: заявка має належати поточному користувачу
+    try:
+        user_tickets = await glpi.get_user_tickets(callback.from_user.id)
+    except Exception as e:
+        log.error("Помилка перевірки заявок при скасуванні: %s", e)
+        await callback.answer("❌ Не вдалося перевірити заявку.", show_alert=True)
+        return
+
+    owned_ids = {t.get(GLPI_FIELD_ID) for t in user_tickets}
+    if str(ticket_id) not in owned_ids:
+        await callback.answer("⛔ Ця заявка вам не належить.", show_alert=True)
+        return
+
     try:
         await glpi.cancel_ticket(ticket_id)
         await callback.answer(f"Заявку #{ticket_id} скасовано.", show_alert=True)
@@ -700,6 +714,7 @@ async def cancel_ticket_confirm(callback: CallbackQuery) -> None:
         return
 
     try:
+        # user_tickets вже отримані вище, але потрібно оновити список після скасування
         tickets = await glpi.get_user_tickets(callback.from_user.id)
         text, kb = _build_tickets_message(tickets)
         await callback.message.edit_text(text, reply_markup=kb)
@@ -736,9 +751,9 @@ async def check_closed_tickets() -> None:
         try:
             tickets = await glpi.get_recently_closed_tickets(since=last_check)
             for ticket in tickets:
-                ticket_id   = ticket.get("2") or ticket.get("id", "?")
-                ticket_name = ticket.get("1") or ticket.get("name", "—")
-                content     = ticket.get("21", "")
+                ticket_id   = ticket.get(GLPI_FIELD_ID) or ticket.get("id", "?")
+                ticket_name = ticket.get(GLPI_FIELD_NAME) or ticket.get("name", "—")
+                content     = ticket.get(GLPI_FIELD_CONTENT, "")
                 match = re.search(r'\[tg:(\d+)\]', content)
                 if not match:
                     continue  # заявка не з бота — пропускаємо
