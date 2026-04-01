@@ -13,7 +13,7 @@ from aiogram.types import (
 )
 from aiogram.utils.markdown import hbold, hcode
 
-from config import CATEGORIES, GLPI_EXTERNAL_URL, TECHNICIANS_CHAT_ID
+from config import CATEGORIES, GLPI_EXTERNAL_URL, PRIORITIES, TECHNICIANS_CHAT_ID
 from keyboards import (
     MAIN_MENU,
     PHONE_MENU,
@@ -76,10 +76,14 @@ async def process_category(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(TicketForm.description, F.text)
 async def process_description(message: Message, state: FSMContext) -> None:
-    if len(message.text.strip()) < 5:
+    text = message.text.strip()
+    if len(text) < 5:
         await message.answer("Будь ласка, опишіть проблему детальніше (мінімум 5 символів).")
         return
-    await state.update_data(description=message.text.strip())
+    if len(text) > 2000:
+        await message.answer("Опис занадто довгий (максимум 2000 символів). Будь ласка, скоротіть.")
+        return
+    await state.update_data(description=text)
     await state.set_state(TicketForm.priority)
     await message.answer("Оберіть пріоритет заявки:", reply_markup=priority_keyboard())
 
@@ -91,7 +95,6 @@ async def description_invalid(message: Message) -> None:
 
 @router.callback_query(TicketForm.priority, F.data.startswith("pri:"))
 async def process_priority(callback: CallbackQuery, state: FSMContext) -> None:
-    from config import PRIORITIES
     val = int(callback.data.removeprefix("pri:"))
     label = next((lbl for lbl, v in PRIORITIES.items() if v == val), None)
     if label is None:
@@ -167,7 +170,6 @@ async def phone_invalid(message: Message) -> None:
 @router.callback_query(TicketForm.confirm, F.data == "confirm:yes")
 async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    await state.clear()
 
     category_name: str = data["category"]
     description: str = data["description"]
@@ -195,6 +197,8 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         )
         await bot.send_message(callback.from_user.id, "Головне меню:", reply_markup=MAIN_MENU)
         return
+
+    await state.clear()
 
     if data.get("photo_file_id"):
         try:

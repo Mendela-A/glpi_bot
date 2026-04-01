@@ -2,9 +2,9 @@ import html
 import logging
 
 from aiogram import Router
-from aiogram.filters import Command, StateFilter, ChatMemberUpdatedFilter, JOIN_TRANSITION
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import ChatMemberUpdated, ErrorEvent, Message
+from aiogram.types import ErrorEvent, Message
 from aiogram.utils.markdown import hbold
 
 from config import ADMIN_CHAT_ID
@@ -15,10 +15,6 @@ from states import FollowupForm, TicketForm
 log = logging.getLogger(__name__)
 router = Router()
 
-
-@router.my_chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
-async def bot_added_to_group(event: ChatMemberUpdated) -> None:
-    pass  # бот входить до групи мовчки
 
 
 @router.message(Command("start"))

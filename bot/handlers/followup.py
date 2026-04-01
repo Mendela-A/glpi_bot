@@ -8,6 +8,10 @@ from keyboards import MAIN_MENU
 from services import glpi
 from states import FollowupForm
 
+
+async def _get_all_user_ticket_ids(user_id: int) -> set[int]:
+    return await glpi.get_all_user_ticket_ids(user_id)
+
 log = logging.getLogger(__name__)
 router = Router()
 
@@ -19,6 +23,21 @@ async def followup_reply_start(callback: CallbackQuery, state: FSMContext) -> No
     except ValueError:
         await callback.answer()
         return
+    if ticket_id <= 0:
+        await callback.answer()
+        return
+
+    # Перевірка власника: заявка має належати поточному користувачу
+    try:
+        owned = await _get_all_user_ticket_ids(callback.from_user.id)
+    except Exception as e:
+        log.error("Помилка перевірки заявок при reply: %s", e)
+        await callback.answer("❌ Не вдалося перевірити заявку.", show_alert=True)
+        return
+    if ticket_id not in owned:
+        await callback.answer("⛔ Ця заявка вам не належить.", show_alert=True)
+        return
+
     await state.set_state(FollowupForm.reply)
     await state.update_data(ticket_id=ticket_id)
     await callback.message.answer(

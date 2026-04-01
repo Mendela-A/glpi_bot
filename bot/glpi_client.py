@@ -9,9 +9,11 @@ from config import (
     GLPI_URL,
     GLPI_USER_TOKEN,
     GLPI_FIELD_CONTENT,
+    GLPI_FIELD_ID,
     GLPI_FIELD_STATUS,
     GLPI_FIELD_NAME,
     GLPI_FIELD_DATE,
+    TICKET_STATUS_CLOSED,
     TICKETS_PER_PAGE,
 )
 
@@ -37,7 +39,9 @@ class GLPIClient:
 
     async def _get_http(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
-            self._http = aiohttp.ClientSession()
+            self._http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
         return self._http
 
     async def init_session(self) -> None:
@@ -134,6 +138,59 @@ class GLPIClient:
                 return data.get("data", []), data.get("totalcount", 0)
             return [], 0
 
+    async def get_active_bot_tickets(self) -> tuple[list[dict], int]:
+        """Повертає всі активні тікети, створені через бот (містять мітку [tg:]).
+
+        Замінює прямий виклик _request у polling.py.
+        """
+        params = {
+            "criteria[0][field]": GLPI_FIELD_CONTENT,
+            "criteria[0][searchtype]": "contains",
+            "criteria[0][value]": "[tg:",
+            "criteria[1][field]": GLPI_FIELD_STATUS,
+            "criteria[1][searchtype]": "notequals",
+            "criteria[1][value]": str(TICKET_STATUS_CLOSED),
+            "forcedisplay[0]": GLPI_FIELD_ID,
+            "forcedisplay[1]": GLPI_FIELD_CONTENT,
+            "forcedisplay[2]": GLPI_FIELD_STATUS,
+            "range": "0-100",
+        }
+        async with await self._request(
+            "GET", f"{GLPI_URL}/apirest.php/search/Ticket", params=params
+        ) as resp:
+            if resp.status not in (200, 206):
+                log.warning("get_active_bot_tickets: unexpected status %s", resp.status)
+                return [], 0
+            data = await resp.json()
+            return data.get("data", []), data.get("totalcount", 0)
+
+    async def get_all_user_ticket_ids(self, user_id: int) -> set[int]:
+        """Повертає множину всіх ID заявок, що належать користувачу.
+
+        Використовується для перевірки власника перед мутуючими операціями.
+        Обходить обмеження сторінки, отримуючи всі заявки одразу (до 500).
+        """
+        params = {
+            "criteria[0][field]": GLPI_FIELD_CONTENT,
+            "criteria[0][searchtype]": "contains",
+            "criteria[0][value]": f"[tg:{user_id}]",
+            "forcedisplay[0]": GLPI_FIELD_ID,
+            "range": "0-499",
+        }
+        async with await self._request(
+            "GET", f"{GLPI_URL}/apirest.php/search/Ticket", params=params
+        ) as resp:
+            if resp.status not in (200, 206):
+                return set()
+            data = await resp.json()
+            ids: set[int] = set()
+            for ticket in data.get("data", []):
+                try:
+                    ids.add(int(ticket[GLPI_FIELD_ID]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            return ids
+
     async def get_categories(self) -> dict[str, int]:
         """Повертає словник {назва: id} категорій з GLPI."""
         async with await self._request(
@@ -210,7 +267,6 @@ class GLPIClient:
 
     async def cancel_ticket(self, ticket_id: int) -> None:
         """Закриває заявку (status=TICKET_STATUS_CLOSED)."""
-        from config import TICKET_STATUS_CLOSED
         async with await self._request(
             "PUT",
             f"{GLPI_URL}/apirest.php/Ticket/{ticket_id}",

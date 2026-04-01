@@ -10,13 +10,15 @@ from config import (
     GLPI_FIELD_CONTENT,
     GLPI_FIELD_ID,
     GLPI_FIELD_STATUS,
-    GLPI_URL,
     POLL_INTERVAL_SEC,
     STATUS_NOTIFY_MESSAGES,
     TICKET_STATUS_CLOSED,
 )
 from services import bot, glpi
 from utils import strip_html
+
+# Максимальний розмір кешу сповіщених follow-up IDs
+_MAX_NOTIFIED_FOLLOWUPS = 10_000
 
 log = logging.getLogger(__name__)
 
@@ -34,37 +36,20 @@ _notified_followups: set[int] = set()
 
 async def _load_bot_tickets() -> None:
     """Завантажує з GLPI всі активні тікети, створені через бот."""
-    params = {
-        "criteria[0][field]": GLPI_FIELD_CONTENT,
-        "criteria[0][searchtype]": "contains",
-        "criteria[0][value]": "[tg:",
-        "criteria[1][field]": GLPI_FIELD_STATUS,
-        "criteria[1][searchtype]": "notequals",
-        "criteria[1][value]": str(TICKET_STATUS_CLOSED),
-        "forcedisplay[0]": GLPI_FIELD_ID,
-        "forcedisplay[1]": GLPI_FIELD_CONTENT,
-        "forcedisplay[2]": GLPI_FIELD_STATUS,
-        "range": "0-100",
-    }
-    async with await glpi._request(
-        "GET", f"{GLPI_URL}/apirest.php/search/Ticket", params=params
-    ) as resp:
-        if resp.status not in (200, 206):
-            return
-        data = await resp.json()
-        for ticket in data.get("data", []):
-            try:
-                ticket_id = int(ticket.get(GLPI_FIELD_ID))
-            except (TypeError, ValueError):
-                continue
-            content = ticket.get(GLPI_FIELD_CONTENT, "")
-            match = re.search(r'\[tg:(\d+)\]', content)
-            if not match:
-                continue
-            user_id = int(match.group(1))
-            status = int(ticket.get(GLPI_FIELD_STATUS, 1))
-            _bot_tickets[ticket_id] = user_id
-            _ticket_status_cache[ticket_id] = status
+    tickets, _ = await glpi.get_active_bot_tickets()
+    for ticket in tickets:
+        try:
+            ticket_id = int(ticket.get(GLPI_FIELD_ID))
+        except (TypeError, ValueError):
+            continue
+        content = ticket.get(GLPI_FIELD_CONTENT, "")
+        match = re.search(r'\[tg:(\d+)\]', content)
+        if not match:
+            continue
+        user_id = int(match.group(1))
+        status = int(ticket.get(GLPI_FIELD_STATUS, 1))
+        _bot_tickets[ticket_id] = user_id
+        _ticket_status_cache[ticket_id] = status
     log.info("Завантажено bot-тікетів: %d", len(_bot_tickets))
 
 
@@ -94,6 +79,7 @@ async def _notify_status_changes() -> None:
 
         if status == TICKET_STATUS_CLOSED:
             _bot_tickets.pop(ticket_id, None)  # закриті більше не відстежуємо
+            _ticket_status_cache.pop(ticket_id, None)
 
 
 async def _notify_new_followups() -> None:
@@ -108,6 +94,9 @@ async def _notify_new_followups() -> None:
             fu_id = fu.get("id")
             if not fu_id or fu_id in _notified_followups:
                 continue
+            # Запобігаємо безкінечному росту множини
+            if len(_notified_followups) >= _MAX_NOTIFIED_FOLLOWUPS:
+                _notified_followups.clear()
             _notified_followups.add(fu_id)
             fu_content = strip_html(str(fu.get("content") or ""))
             if not fu_content:

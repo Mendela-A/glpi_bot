@@ -57,6 +57,8 @@ async def tickets_page(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer()
         return
+    if offset < 0:
+        offset = 0
     try:
         tickets, total = await glpi.get_user_tickets(callback.from_user.id, offset=offset)
     except Exception as e:
@@ -85,6 +87,21 @@ async def ticket_detail(callback: CallbackQuery) -> None:
     except ValueError:
         await callback.answer()
         return
+    if ticket_id <= 0:
+        await callback.answer()
+        return
+
+    # Перевірка власника: не допускаємо перегляд чужих заявок
+    try:
+        owned_ids = await glpi.get_all_user_ticket_ids(callback.from_user.id)
+    except Exception as e:
+        log.error("Помилка перевірки заявок при перегляді: %s", e)
+        await callback.answer("❌ Не вдалося перевірити заявку.", show_alert=True)
+        return
+    if ticket_id not in owned_ids:
+        await callback.answer("⛔ Ця заявка вам не належить.", show_alert=True)
+        return
+
     try:
         ticket = await glpi.get_ticket(ticket_id)
         followups = await glpi.get_ticket_followups(ticket_id)
@@ -148,14 +165,13 @@ async def cancel_ticket_confirm(callback: CallbackQuery) -> None:
 
     # Перевірка власника: заявка має належати поточному користувачу
     try:
-        user_tickets, _ = await glpi.get_user_tickets(callback.from_user.id, offset=0, limit=20)
+        owned_ids = await glpi.get_all_user_ticket_ids(callback.from_user.id)
     except Exception as e:
         log.error("Помилка перевірки заявок при скасуванні: %s", e)
         await callback.answer("❌ Не вдалося перевірити заявку.", show_alert=True)
         return
 
-    owned_ids = {t.get(GLPI_FIELD_ID) for t in user_tickets}
-    if str(ticket_id) not in owned_ids:
+    if ticket_id not in owned_ids:
         await callback.answer("⛔ Ця заявка вам не належить.", show_alert=True)
         return
 
