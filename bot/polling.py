@@ -131,7 +131,7 @@ async def check_ticket_updates() -> None:
     while True:
         await asyncio.sleep(POLL_INTERVAL_SEC)
         try:
-            await _notify_status_changes()
-            await _notify_new_followups()
+            await _notify_new_followups()   # спочатку коментарі (тікет ще в кеші)
+            await _notify_status_changes()  # потім статус (може видалити закриті з кешу)
         except Exception as e:
             log.error("Помилка перевірки оновлень заявок: %s", e)
