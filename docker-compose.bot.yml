@@ -1,0 +1,21 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: glpi_redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  bot:
+    build: ./bot
+    container_name: glpi_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # доступ до GLPI на хості
+    depends_on:
+      - redis
+
+volumes:
+  redis_data:

@@ -1,7 +1,29 @@
+# Secrets
 .env
+
+# GLPI runtime data (DB credentials, encryption keys, uploaded files)
+glpi/config/
+glpi/files/
+
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
-.pytest_cache/
-venv/
 *.egg-info/
+venv/
+.venv/
+
+# Tests
+.pytest_cache/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
