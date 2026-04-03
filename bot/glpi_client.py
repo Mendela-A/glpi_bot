@@ -40,7 +40,8 @@ class GLPIClient:
     async def _get_http(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
             self._http = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=30),
+                connector=aiohttp.TCPConnector(ssl=False),  # GLPI використовує самопідписний сертифікат
             )
         return self._http
 

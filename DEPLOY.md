@@ -1,14 +1,14 @@
 # Розгортання GLPI Telegram Bot на CentOS 9
 
-> Сценарій: GLPI встановлений нативно на хості (без Docker).
-> Бот і Redis запускаються у Docker-контейнерах на тій самій машині.
+> Сценарій: GLPI встановлений нативно на хості (без Docker), працює на HTTPS порту 443
+> з самопідписним сертифікатом. Бот і Redis запускаються у Docker-контейнерах на тій самій машині.
 
 ---
 
 ## Вимоги
 
 - CentOS 9 з Docker CE (інструкція нижче)
-- GLPI запущений на хості (Apache/Nginx + PHP + MariaDB)
+- GLPI запущений на хості (Apache/Nginx + PHP + MariaDB) на порту 443
 - Машина має **вихідний** доступ до інтернету на порту 443 (`api.telegram.org`) — потрібен для polling
 
 ---
@@ -50,11 +50,15 @@ vim .env
 |--------|---------|
 | `BOT_TOKEN` | токен від @BotFather |
 | `TECHNICIANS_CHAT_ID` | ID групи техніків (від'ємне число) |
-| `GLPI_URL` | `http://host.docker.internal:80` — порт де GLPI слухає на хості |
-| `GLPI_EXTERNAL_URL` | `http://192.168.X.X:80` — IP машини в локалці (для посилань у повідомленнях) |
+| `GLPI_URL` | `https://host.docker.internal:443` — GLPI на хості через HTTPS |
+| `GLPI_EXTERNAL_URL` | `https://192.168.X.X` — IP машини в локалці (для посилань у повідомленнях) |
 | `GLPI_APP_TOKEN` | Налаштування GLPI → Загальне → API |
 | `GLPI_USER_TOKEN` | Профіль користувача GLPI → API token |
 | `REDIS_URL` | `redis://redis:6379/0` (залишити як є) |
+
+> **Самопідписний сертифікат:** бот автоматично вимикає перевірку SSL для з'єднання
+> з GLPI (`ssl=False` в aiohttp). З'єднання все одно шифрується, перевірка сертифіката
+> не виконується — це прийнятно для внутрішньої мережі.
 
 ### Як отримати ID групи Telegram
 
@@ -75,7 +79,7 @@ sudo firewall-cmd --reload
 Перевірити що GLPI доступний з контейнера:
 ```bash
 docker run --rm --add-host=host.docker.internal:host-gateway curlimages/curl \
-  curl -s http://host.docker.internal:80/apirest.php
+  curl -sk https://host.docker.internal:443/apirest.php
 # має повернути JSON з version
 ```
 
@@ -130,10 +134,11 @@ docker logs glpi_bot -f
 
 ## Troubleshooting
 
-**`ConnectionRefusedError` до GLPI**
+**`SSLCertVerificationError` або `ConnectionError` до GLPI**
 - Перевірити що firewalld дозволяє трафік з Docker bridge (крок 4)
-- Перевірити порт: `ss -tlnp | grep :80`
-- Перевірити `GLPI_URL` в `.env` — чи правильний порт
+- Перевірити порт: `ss -tlnp | grep :443`
+- Перевірити `GLPI_URL` в `.env` — має бути `https://host.docker.internal:443`
+- Протестувати вручну: `curl -sk https://host.docker.internal:443/apirest.php`
 
 **Бот не відповідає**
 - `docker logs glpi_bot` — шукати `ERROR`
