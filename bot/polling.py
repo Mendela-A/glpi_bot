@@ -51,6 +51,17 @@ async def _load_bot_tickets() -> None:
         _bot_tickets[ticket_id] = user_id
         _ticket_status_cache[ticket_id] = status
     log.info("Завантажено bot-тікетів: %d", len(_bot_tickets))
+    for ticket_id in list(_bot_tickets):
+        try:
+            followups = await glpi.get_ticket_followups(ticket_id)
+        except Exception as e:
+            log.warning("Не вдалося завантажити follow-ups #%s при старті: %s", ticket_id, e)
+            continue
+        for fu in followups:
+            fu_id = fu.get("id")
+            if fu_id:
+                _notified_followups.add(fu_id)
+    log.info("Завантажено follow-up IDs при старті: %d", len(_notified_followups))
 
 
 async def _notify_status_changes() -> None:

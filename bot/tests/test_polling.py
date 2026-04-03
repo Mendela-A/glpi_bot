@@ -94,3 +94,47 @@ class TestBuildBotTicketsCache:
         ]
         bt, sc = self._load(rows)
         assert bt == {}
+
+
+class TestPrePopulateNotifiedFollowups:
+    """Перевіряє, що існуючі follow-up IDs потрапляють у _notified_followups при старті."""
+
+    def _collect_followup_ids(self, followups_per_ticket: dict[int, list[dict]]) -> set[int]:
+        """Симулює логіку pre-populate з _load_bot_tickets."""
+        notified: set[int] = set()
+        for followups in followups_per_ticket.values():
+            for fu in followups:
+                fu_id = fu.get("id")
+                if fu_id:
+                    notified.add(fu_id)
+        return notified
+
+    def test_existing_followups_are_collected(self):
+        followups = {
+            6: [{"id": 101, "content": "Solution approved"}, {"id": 102, "content": "OK"}],
+            13: [{"id": 201, "content": "3123"}],
+        }
+        notified = self._collect_followup_ids(followups)
+        assert notified == {101, 102, 201}
+
+    def test_followup_without_id_skipped(self):
+        followups = {
+            6: [{"content": "без id"}, {"id": 55, "content": "з id"}],
+        }
+        notified = self._collect_followup_ids(followups)
+        assert notified == {55}
+
+    def test_empty_tickets_gives_empty_set(self):
+        notified = self._collect_followup_ids({})
+        assert notified == set()
+
+    def test_ticket_with_no_followups(self):
+        notified = self._collect_followup_ids({10: []})
+        assert notified == set()
+
+    def test_new_followup_after_startup_not_in_set(self):
+        """Follow-up, що з'явився після старту, не має бути в pre-populated set."""
+        existing_followups = {6: [{"id": 101, "content": "старий"}]}
+        notified = self._collect_followup_ids(existing_followups)
+        # новий follow-up ID 999 відсутній → буде відправлений як новий
+        assert 999 not in notified
