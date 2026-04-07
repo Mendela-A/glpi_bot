@@ -1,5 +1,6 @@
 import html
 import logging
+import time
 
 from aiogram import F, Router
 from aiogram.filters import StateFilter
@@ -13,7 +14,7 @@ from aiogram.types import (
 )
 from aiogram.utils.markdown import hbold, hcode
 
-from config import CATEGORIES, GLPI_EXTERNAL_URL, PRIORITIES, TECHNICIANS_CHAT_ID
+from config import CATEGORIES, CATEGORIES_TTL, GLPI_EXTERNAL_URL, PRIORITIES, TECHNICIANS_CHAT_ID
 from keyboards import (
     MAIN_MENU,
     PHONE_MENU,
@@ -28,6 +29,8 @@ from states import TicketForm
 
 log = logging.getLogger(__name__)
 router = Router()
+
+_categories_updated_at: float = 0.0
 
 
 @router.message(F.text == "❌ Скасувати заявку", StateFilter(TicketForm))
@@ -46,6 +49,17 @@ async def cancel_form_inline(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.message(F.text == "📝 Створити заявку")
 async def start_ticket(message: Message, state: FSMContext) -> None:
+    global _categories_updated_at
+    if time.time() - _categories_updated_at > CATEGORIES_TTL:
+        try:
+            fresh = await glpi.get_categories()
+            CATEGORIES.clear()
+            CATEGORIES.update(fresh)
+            _categories_updated_at = time.time()
+            log.info("Категорії оновлено: %d шт.", len(CATEGORIES))
+        except Exception as e:
+            log.warning("Не вдалося оновити категорії: %s", e)
+
     kb = categories_keyboard()
     if kb is None:
         await message.answer("⚠️ Категорії недоступні. Спробуйте пізніше.")
@@ -220,18 +234,19 @@ async def process_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     username_part = f"@{user.username}" if user.username else user.full_name
     phone_part = f"\n📱 Тел: {data['phone']}" if data.get("phone") else ""
     priority_label = data.get("priority_label", "🟡 Середній")
-    try:
-        await bot.send_message(
-            TECHNICIANS_CHAT_ID,
-            f"🆕 Нова заявка {hbold(f'#{ticket_id}')}\n"
-            f"👤 Від: {username_part} (ID: {hcode(str(user.id))}){phone_part}\n"
-            f"📂 Категорія: {html.escape(category_name)}\n"
-            f"⚡ Пріоритет: {priority_label}\n"
-            f"📝 {html.escape(description)}\n"
-            f"🔗 {ticket_url}",
-        )
-    except Exception as e:
-        log.warning("Не вдалося сповістити технічний чат: %s", e)
+    # TODO: re-enable when GLPI webhook is removed (зараз дублюється через GLPI webhook)
+    # try:
+    #     await bot.send_message(
+    #         TECHNICIANS_CHAT_ID,
+    #         f"🆕 Нова заявка {hbold(f'#{ticket_id}')}\n"
+    #         f"👤 Від: {username_part} (ID: {hcode(str(user.id))}){phone_part}\n"
+    #         f"📂 Категорія: {html.escape(category_name)}\n"
+    #         f"⚡ Пріоритет: {priority_label}\n"
+    #         f"📝 {html.escape(description)}\n"
+    #         f"🔗 {ticket_url}",
+    #     )
+    # except Exception as e:
+    #     log.warning("Не вдалося сповістити технічний чат: %s", e)
 
     _bot_tickets[ticket_id] = user.id
     _ticket_status_cache[ticket_id] = 1  # статус "Нова"

@@ -55,5 +55,7 @@ STATUS_NOTIFY_MESSAGES: dict[int, str] = {
     6: "🔒 Вашу заявку {ticket} закрито.",
 }
 
+CATEGORIES_TTL: int = 86400  # 24 години
+
 # Завантажується динамічно з GLPI при старті
 CATEGORIES: dict[str, int] = {}
